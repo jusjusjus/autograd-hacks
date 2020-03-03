@@ -32,7 +32,7 @@ _supported_layers = ['Linear', 'Conv2d']
 # work-around for https://github.com/pytorch/pytorch/issues/25723
 _hooks_disabled: bool = False
 # global switch to catch double backprop errors on Hessian computation
-_enforce_fresh_backprop: bool = False
+_enforce_fresh_backprop: bool = True
 _enforce_fresh_activation: bool = False
 
 
@@ -104,8 +104,9 @@ def _layer_type(layer: nn.Module) -> str:
 
 
 def _capture_activations(layer: nn.Module, input: List[torch.Tensor], output: torch.Tensor):
-    """Save activations into layer.activations in forward pass"""
-    global _enforce_fresh_activation
+    """Save activations into `layer.activations_list` in forward pass"""
+    global _enforce_fresh_activation, _enforce_fresh_backprop
+    _enforce_fresh_backprop = True
     if _hooks_disabled:
         return
 
@@ -119,6 +120,7 @@ def _capture_activations(layer: nn.Module, input: List[torch.Tensor], output: to
 
     assert _layer_type(layer) in _supported_layers, """
     Hook installed on unsupported layer, this shouldn't happen"""
+    assert len(input) == 1, len(input)
     layer.activations_list.append(input[0].detach())
 
 
@@ -159,7 +161,8 @@ def compute_grad1_for_conv2d(layer, A, B):
     B = B.reshape(n, -1, A.shape[-1])
     grad1 = torch.einsum('ijk,ilk->ijl', B, A)
     shape = [n] + list(layer.weight.shape)
-    append(layer.weight, 'grad1', grad1.reshape(shape))
+    grad1 = grad1.reshape(shape)
+    append(layer.weight, 'grad1', grad1)
     if layer.bias is not None:
         append(layer.bias, 'grad1', torch.sum(B, dim=2))
 
@@ -204,10 +207,11 @@ def compute_grad1(model: nn.Module, loss_type: str = 'mean') -> None:
             continue
         assert hasattr(layer, 'activations_list'), "No activations detected, run forward after add_hooks(model)"
         assert hasattr(layer, 'backprops_list'), "No backprops detected, run backward after add_hooks(model)"
-        assert len(layer.activations_list) == len(layer.backprops_list)
+        assert len(layer.activations_list) == len(layer.backprops_list), f"""
+        {len(layer.activations_list)} != {len(layer.backprops_list)}"""
 
         clear_grad_for[layer_type](layer)
-        for A, B in zip(layer.activations_list, layer.backprops_list):
+        for A, B in zip(layer.activations_list[::-1], layer.backprops_list):
             if loss_type == 'mean':
                 B *= A.shape[0]
 

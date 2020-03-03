@@ -26,12 +26,23 @@ class StriddenNet(nn.Module):
         return x
 
 
+class SimpleNet(nn.Module):
+    """Lenet-5 from https://github.com/pytorch/examples/blob/master/mnist/main.py"""
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(28 * 28, 10)
+
+    def forward(self, x):
+        x = torch.flatten(x, 1)
+        return self.linear(x)
+
+
 class Net(nn.Module):
     """Lenet-5 from https://github.com/pytorch/examples/blob/master/mnist/main.py"""
     def __init__(self):
-        super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(1, 20, 5, 1)
-        self.conv2 = nn.Conv2d(20, 50, 5, 1)
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 20, 5)
+        self.conv2 = nn.Conv2d(20, 50, 5)
         self.fc1 = nn.Linear(4 * 4 * 50, 500)
         self.fc2 = nn.Linear(500, 10)
 
@@ -50,7 +61,7 @@ class TinyNet(nn.Module):
     """Tiny LeNet-5 for Hessian testing"""
 
     def __init__(self):
-        super(TinyNet, self).__init__()
+        super().__init__()
         self.conv1 = nn.Conv2d(1, 2, 2, 1)
         self.conv2 = nn.Conv2d(2, 2, 2, 1)
         self.fc1 = nn.Linear(2, 2)
@@ -85,7 +96,7 @@ def hessian(y: torch.Tensor, x: torch.Tensor):
     return jacobian(jacobian(y, x, create_graph=True), x)
 
 
-@pytest.mark.parametrize("Net", [Net, TinyNet, StriddenNet])
+@pytest.mark.parametrize("Net", [Net, TinyNet, SimpleNet, StriddenNet])
 def test_grad1(Net):
     torch.manual_seed(1)
     model = Net()
@@ -114,39 +125,50 @@ def test_grad1(Net):
             assert torch.allclose(jacobian(losses, param), param.grad1[0])
 
 
-def test_grad1_for_multiple_passes():
+def test_applying_backwards_twice_fails():
     torch.manual_seed(42)
     model = Net()
     loss_fn = nn.CrossEntropyLoss()
+
+    data = torch.rand(5, 1, 28, 28)
+    targets = torch.LongTensor(5).random_(0, 10)
+
+    autograd_hacks.add_hooks(model)
+    output = model(data)
+    loss_fn(output, targets).backward()
+    output = model(data)
+    with pytest.raises(AssertionError):
+        loss_fn(output, targets).backward()
+
+
+def test_grad1_for_multiple_connected_passes():
+    torch.manual_seed(42)
+    model = SimpleNet()
+    loss_fn = nn.CrossEntropyLoss(reduction='sum')
 
     def get_data(batch_size):
         return (torch.rand(batch_size, 1, 28, 28),
                 torch.LongTensor(batch_size).random_(0, 10))
 
-    n1 = 4
-    n2 = 10
-
+    n = 5
     autograd_hacks.add_hooks(model)
 
-    data, targets = get_data(n1)
+    data, targets = get_data(n)
     output = model(data)
-    loss_fn(output, targets).backward(retain_graph=True)
-    grads = [{n: p.grad.clone() for n, p in model.named_parameters()}]
-    model.zero_grad()
-
-    data, targets = get_data(n2)
+    loss1 = loss_fn(output, targets)
+    data, targets = get_data(n)
     output = model(data)
-    loss_fn(output, targets).backward(retain_graph=True)
-    grads.append({n: p.grad for n, p in model.named_parameters()})
+    loss2 = loss_fn(output, targets)
+    loss = loss1 - loss2
+    loss.backward()
 
     autograd_hacks.compute_grad1(model)
-
     autograd_hacks.disable_hooks()
 
     for n, p in model.named_parameters():
-        for i, grad in enumerate(grads):
-            assert grad[n].shape == p.grad1[i].shape[1:]
-            assert torch.allclose(grad[n], p.grad1[i].mean(dim=0))
+        grad1 = p.grad1[0] + p.grad1[1]
+        assert p.grad.shape == grad1.shape[1:]
+        assert torch.allclose(p.grad, grad1.mean(dim=0), atol=1e-7)
 
 
 @pytest.mark.parametrize("hess_type", ['CrossEntropy', 'LeastSquares'])
